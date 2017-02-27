@@ -244,25 +244,112 @@ int vdisk_cmp(const void * elem1, const void * elem2) {
   return 0;
 }
 
-void hash_distribution(struct sd_vnode *vdisks[], int size) {
-  qsort(vdisks, size, sizeof(struct sd_vnode *), vdisk_cmp);
-  double occupation[size];
-  uint64_t previous = 0;
-  for (int i = 0; i < size; i++) {
-    occupation[vdisks[i]->node->zone] = (double)(vdisks[i]->hash - previous) / UINT64_MAX;
-    previous = vdisks[i]->hash;
-  }
+#define __LOCAL(var, line) __ ## var ## line
+#define _LOCAL(var, line) __LOCAL(var, line)
+#define LOCAL(var) _LOCAL(var, __LINE__)
 
-  printf("hash  ");
-  for (int i = 0; i < size; i++)
-    printf("  %.02f ", occupation[i]);
-  printf("\n");
+#define rb_entry(ptr, type, member) container_of(ptr, type, member)
+
+#define rb_for_each_entry(pos, root, member)				\
+	for (struct rb_node *LOCAL(p) = rb_first(root), *LOCAL(n);	\
+	     LOCAL(p) && (LOCAL(n) = rb_next(LOCAL(p)), 1) &&		\
+		     (pos = rb_entry(LOCAL(p), typeof(*pos), member), 1); \
+	     LOCAL(p) = LOCAL(n))
+
+static inline void
+node_to_vnodes(const struct sd_node *n, struct rb_root *vroot)
+{
+	uint64_t hval = sd_hash(&n->nid, offsetof(typeof(n->nid),
+						  io_addr));
+
+	for (int i = 0; i < n->nr_vnodes; i++) {
+		struct sd_vnode *v = calloc(sizeof(*v), 1);
+
+		hval = sd_hash_next(hval);
+		v->hash = hval;
+		v->node = n;
+		if (unlikely(rb_insert(vroot, v, rb, vnode_cmp)))
+			panic("vdisk hash collison");
+	}
+}
+
+static inline void
+nodes_to_vnodes(struct rb_root *nroot, struct rb_root *vroot)
+{
+	struct sd_node *n;
+
+	rb_for_each_entry(n, nroot, rb)
+		node_to_vnodes(n, vroot);
+}
+
+
+#define MAX_NODE_STR_LEN 256
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define HOST_NAME_MAX 256
+
+const char *addr_to_str(const uint8_t *addr, uint16_t port)
+{
+	static __thread char str[HOST_NAME_MAX + 8];
+	int af = AF_INET6;
+	int addr_start_idx = 0;
+	const char *ret;
+
+	/* Find address family type */
+	if (addr[12]) {
+		int  oct_no = 0;
+		while (!addr[oct_no] && oct_no++ < 12)
+			;
+		if (oct_no == 12) {
+			af = AF_INET;
+			addr_start_idx = 12;
+		}
+	}
+	ret = inet_ntop(af, addr + addr_start_idx, str, sizeof(str));
+	if (unlikely(ret == NULL))
+		panic("failed to convert addr to string, %m");
+
+	if (port) {
+		int  len = strlen(str);
+		snprintf(str + len, sizeof(str) - len, ":%d", port);
+	}
+
+	return str;
+}
+
+static inline const char *node_id_to_str(const struct node_id *id)
+{
+	static __thread char str[MAX_NODE_STR_LEN];
+	int af = AF_INET6;
+	const uint8_t *addr = id->addr;
+
+	/* Find address family type */
+	if (addr[12]) {
+		int  oct_no = 0;
+		while (!addr[oct_no] && oct_no++ < 12)
+			;
+		if (oct_no == 12)
+			af = AF_INET;
+	}
+
+	snprintf(str, sizeof(str), "%s ip:%s port:%d",
+		(af == AF_INET) ? "IPv4" : "IPv6",
+		addr_to_str(id->addr, 0), id->port);
+
+	return str;
+}
+
+static inline const char *node_to_str(const struct sd_node *id)
+{
+	return node_id_to_str(&id->nid);
 }
 
 void map_with_sheepdog(int replication_count, int hosts_count, int object_map[][NUMBER_OF_OBJECTS]) {
-  struct sd_vnode *vdisks[hosts_count];
-  struct rb_root root;
-  INIT_RB_ROOT(&root);
+  struct rb_root nroot, vroot;
+  INIT_RB_ROOT(&nroot);
+  INIT_RB_ROOT(&vroot);
   for(int host = 0; host < hosts_count; host++) {
     // create a host, with a uniq addr & zone
     struct sd_node *node = (struct sd_node*)malloc(sizeof(struct sd_node));
@@ -271,31 +358,22 @@ void map_with_sheepdog(int replication_count, int hosts_count, int object_map[][
     node->nid.addr[15] = host;
     node->nid.port = host;
     node->zone = host;
-    uint64_t hval = sd_hash(&node->nid, offsetof(typeof(node->nid), io_addr));
-    // attach a vdisk to the host
-    // mimic the code of node_to_vnodes(v->node, &root);
-    struct sd_vnode *vdisk = (struct sd_vnode*)malloc(sizeof(struct sd_vnode));
-    hval = sd_hash_next(hval);
-    vdisk->hash = hval;
-    vdisk->node = node;
-    if (unlikely(rb_insert(&root, vdisk, rb, vnode_cmp)))
-      panic("hash collison");
-    vdisks[host] = vdisk;
+    node->nr_vnodes = 128;	/* FIXME: should be configurable */
+
+    rb_insert(&nroot, node, rb, node_cmp);
   }
+
+  nodes_to_vnodes(&nroot, &vroot);
 
   for(int oid = 0; oid < NUMBER_OF_OBJECTS; oid++) {
     const struct sd_vnode *result[replication_count];
-    memset(result, '\0', sizeof(result));
-    oid_to_vnodes(oid, &root, replication_count, result);
+    memset(result, 0, sizeof(struct sd_vnode *) * replication_count);
+    oid_to_vnodes(oid, &vroot, replication_count, result);
     for(int i = 0; i < replication_count; i++) {
       assert(result[i]);
       object_map[i][oid] = result[i]->node->zone;
     }
   }
-  
-  hash_distribution(vdisks, hosts_count);
-  for(int host = 0; host < hosts_count; host++)
-    deallocate_vnode(vdisks[host]);
 }
 #endif
 
